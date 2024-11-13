@@ -1,0 +1,1579 @@
+#include <stdio.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+//Calculate minimum value
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+#define SERVER_LISTEN_PORT 7777
+#define CLIENT_PORT 3000
+#define MAX_TX_BUFF_SIZE 100
+#define MAX_RX_BUFF_SIZE 256
+
+//Boot status
+#define BOOT_UP_MSG 1
+#define DIAGNOSTIC_MSG 0
+
+//Power source
+#define MAINS 0
+#define BATTERY 1
+
+//Cover open status
+#define COVER_CLOSE 0
+#define COVER_OPEN 1
+#define MAX_CONTAINERS 6
+#define MAX_RETRY_COUNT 4
+#define DEBUG_PRINT 1
+
+typedef enum
+{
+    DLMS_DATA_TYPE_UINT32 = 6,
+    DLMS_DATA_TYPE_STRING = 10,
+    DLMS_DATA_TYPE_UINT8 = 17,
+    DLMS_DATA_TYPE_UINT16 = 18,
+    DLMS_DATA_TYPE_DATETIME = 25,
+} DLMS_DATA_TYPE;
+
+#pragma pack(1)
+typedef struct
+{
+    uint8_t start_byte;
+    uint16_t packet_length;
+    uint8_t frame_id;
+    uint8_t command;
+    uint8_t sub_command;
+    uint8_t job_id[6];
+    uint8_t optional[10];
+}bsmart_iot_frame_struct_t;
+
+typedef enum
+{
+    GATEWAY_COMMAND = 0x00, WIREPAS_COMMAND = 0x01, FOTA_COMMAND = 0x02,
+    RESTART_SUBCOMMAND = 0x00, FW_VERSION_SUBCOMMAND = 0x01, DIAG_INTERVAL_CONF_SUBCOMMAND = 0x02, RTC_SYNC = 0x03, DIAGNOSTIC_SUBCOMMAND = 0x04, SIM_INFO_SUBCOMMAND = 0x05,
+    STOP_SERVICE_SUBCOMMAND = 0x00, START_SERVICE_SUBCOMMAND = 0x01, SINK_STATUS_SUBCOMMAND = 0x02, START_STACK_SUBCOMMAND = 0x03, STOP_STACK_SUBCOMMAND = 0x04, RESTART_SERVICE_SUBCOMMAND = 0x05, PROD_TEST_SUBCOMMAND = 0x06, SINK_CONFIG_SUBCOMMAND = 0x07, CHANGE_ADDRESS_SUBCOMMAND = 0x08, 
+    ERASE_SUBCOMMAND = 0x00, SET_INFO_SUBCOMMAND = 0x01, IMAGE_TRANSFER_SUBCOMMAND = 0x02, VERIFY_IMAGE_SUBCOMMAND = 0x03, ACTIVATE_IMAGE_SUBCOMMAND = 0x04
+}pkt_enum;
+
+#pragma pack(1)
+typedef struct
+{
+    uint8_t buffer[MAX_TX_BUFF_SIZE];
+    uint16_t length;
+}read_gateway_info_struct_t;
+
+void send_to_server(uint8_t* payload, uint16_t payload_len);
+pthread_t TCP_ServerReadThread, TCP_ClientPushThread[10];
+read_gateway_info_struct_t read_gateway_data;
+uint8_t tcp_tx_buffer[MAX_TX_BUFF_SIZE], on_demand_response_buffer[1024], hostname[30], retry_count = 0, tcp_send_flag = 0, ondemand_diagnostic_flag = 0;
+uint16_t tcp_tx_buffer_index, on_demand_response_buffer_index;
+FILE* fp, * firmware_file_pointer;
+char* SERVER_ADDR, CLIENT_ADDR[130], command[220], cover_open_status = 0;
+int server_accept_socket = -1, diagnostic_interval_time = 900;
+int SERVER_PORT;
+bsmart_iot_frame_struct_t bsmart_iot_frame_structure;
+void read_gateway_info(const char* command, read_gateway_info_struct_t* ouptut_data_struct);
+void send_diagnostic_msg(uint8_t ondemand_diagnostic_flag);
+
+uint8_t calculate_checksum(uint8_t input_buff[], uint16_t buff_len)
+{
+    uint16_t check_sum_value = 0;
+    for (uint16_t i = 0; i < buff_len; i++)
+    {
+        check_sum_value += input_buff[i];
+    }
+
+    return check_sum_value;
+}
+/*
+crc_calc() -- calculate cumulative crc-16 for buffer
+*/
+uint16_t crc_calculator(char* pData, int length)
+{
+    printf("\nImage size : %d\n", length);
+    uint8_t i;
+    uint16_t wCrc = 0xffff;
+    while (length--) {
+        wCrc ^= *(unsigned char*)pData++ << 8;
+        for (i = 0; i < 8; i++)
+            wCrc = wCrc & 0x8000 ? (wCrc << 1) ^ 0x1021 : wCrc << 1;
+    }
+    return wCrc & 0xffff;
+}
+bool open_file(const char* file_name, const char* mode_of_operation)
+{
+    firmware_file_pointer = fopen(file_name, mode_of_operation);
+    if (!(firmware_file_pointer))
+    {
+        printf("\nFailed to open (file pointer is null) %s\n", file_name);
+        return 1;
+    }
+    return 0;
+}
+void execute_command(const char* command)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Child process, execute the command
+        if (system(command) == -1) {
+            perror("Error executing command");
+        }
+    }
+    else if (pid == -1) {
+        // Fork failed
+        perror("Fork failed");
+    }
+}
+
+int verify_command_output()
+{
+    char line[256];
+    int count = 0;
+
+    chdir("/usr/local/bin");
+    FILE* file = fopen("sink_config.txt", "r");
+    if (file == NULL) {
+        perror("Error opening file");
+        return -1;
+    }
+    while (fgets(line, sizeof(line), file))
+    {
+        if (strstr(line, "Success") != NULL)
+        {
+            count++;
+        }
+    }
+
+    fclose(file);
+
+#if DEBUG_PRINT
+    printf("ON DEMAND DEBUG : Occurence of success : %d\n", count);
+#endif
+
+    return count;
+}
+bool read_json(uint8_t* out_buff, uint16_t* length)
+{
+    chdir("/usr/local/bin");
+    FILE* file = fopen("sink_config.txt", "r");
+
+    if (file == NULL) {
+        printf("Error opening the file\n");
+        return false;
+    }
+
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    if (file_size <= 0)
+    {
+#if DEBUG_PRINT
+        printf("ON DEMAND ERROR : Failed to fetch sink configuration\n");
+#endif
+        fclose(file);
+        return false;
+    }
+
+    uint8_t temp_buffer[file_size];
+    size_t bytes_read = fread(temp_buffer, 1, file_size, file);
+    fclose(file);
+
+    if (bytes_read != (size_t)file_size)
+    {
+#if DEBUG_PRINT
+        printf("ERROR : Error reading the sink configuration file\n");
+#endif
+        return false;
+    }
+
+    // Check if "error" is found in the file
+    if (strstr((char*)temp_buffer, "Error") != NULL)
+    {
+#if DEBUG_PRINT
+        printf("ON DEMAND ERROR : Failed to fetch sink configuration\n");
+#endif
+        return false;
+    }
+
+    // success byte
+    out_buff[*length] = 0x00;
+    *length += 1;
+    out_buff[*length] = DLMS_DATA_TYPE_STRING;
+    *length += 1;
+    out_buff[*length] = (uint16_t) (bytes_read >> 8);
+    *length += 1;
+    out_buff[*length] = (uint16_t) bytes_read;
+    *length += 1;
+
+    memcpy(&out_buff[*length], temp_buffer, bytes_read);
+    *length += (uint16_t)bytes_read;
+
+    printf("\n");
+
+    return true;
+}
+void process_receive_command(bsmart_iot_frame_struct_t* tcp_rx_packet, uint16_t* tcp_rx_buffer_index, int* server_accept_socket)
+{
+    uint8_t response_send_flag = 0;
+
+#if DEBUG_PRINT
+    printf("\nON DEMAND DEBUG : In process_receive_command\n");
+#endif
+    //Copy the recived JOB ID from HES
+    memcpy(&on_demand_response_buffer[on_demand_response_buffer_index], &tcp_rx_packet->job_id, 6);
+    on_demand_response_buffer_index = on_demand_response_buffer_index + 6;
+
+    switch (tcp_rx_packet->command)
+    {
+    case GATEWAY_COMMAND:
+    {
+        switch (tcp_rx_packet->sub_command)
+        {
+        case RESTART_SUBCOMMAND:
+        {
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = 0x00;
+            on_demand_response_buffer_index += 1;
+#if DEBUG_PRINT
+            printf("ON_DEMAND RESTART DEBUG : On demand RESTART response to be send : ");
+            for (uint8_t i = 0; i < on_demand_response_buffer_index; i++) {
+                printf("%02X ", on_demand_response_buffer[i]);
+            }
+            printf("\n");
+#endif
+
+            write(*server_accept_socket, &on_demand_response_buffer[0], on_demand_response_buffer_index);
+            sleep(3);
+            if (system("reboot") == -1)
+            {
+                printf("ON DEMAND ERROR : Failed to restart\n");
+            }
+        }
+        break;
+        case FW_VERSION_SUBCOMMAND:
+        {
+#if DEBUG_PRINT
+            printf("ON DEMAND DEBUG : In FW_VERSION_SUBCOMMAND\n");
+#endif
+
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_STRING;
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = 17;
+            on_demand_response_buffer_index += 1;
+            memcpy(&on_demand_response_buffer[on_demand_response_buffer_index], "bSmartIOT_GW_v1.0", 17);
+            on_demand_response_buffer_index += 17;
+        }
+        break;
+        case DIAG_INTERVAL_CONF_SUBCOMMAND:
+        {
+            diagnostic_interval_time = (int)((tcp_rx_packet->optional[0] << 8) | (tcp_rx_packet->optional[1]));
+#if DEBUG_PRINT
+            printf("ON DEMAND DEBUG : Diagnostic interval changed : %d\n", diagnostic_interval_time);
+#endif
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = 0x00;
+            on_demand_response_buffer_index += 1;
+        }
+        break;
+        case RTC_SYNC:
+        {
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+            on_demand_response_buffer_index += 1;
+            uint32_t epoch_int = (tcp_rx_packet->optional[0] << 24) |
+                (tcp_rx_packet->optional[1] << 16) |
+                (tcp_rx_packet->optional[2] << 8) |
+                (tcp_rx_packet->optional[3]);
+            sprintf(command, "date --set=@%d", epoch_int);
+            if (system(command) == -1)
+            {
+                printf("ON DEMAND ERROR : RTC sync failed\n");
+                on_demand_response_buffer[on_demand_response_buffer_index] = 0x01;
+            }
+            else
+            {
+                printf("ON DEMAND SUCCESS : RTC sync\n");
+                on_demand_response_buffer[on_demand_response_buffer_index] = 0x00;
+            }
+            on_demand_response_buffer_index += 1;
+        }
+        break;
+        case DIAGNOSTIC_SUBCOMMAND:
+        {
+            ondemand_diagnostic_flag = 1;
+            send_diagnostic_msg(ondemand_diagnostic_flag);
+            ondemand_diagnostic_flag = 0;
+            memcpy(&on_demand_response_buffer[on_demand_response_buffer_index], &tcp_tx_buffer[0], tcp_tx_buffer_index);
+            on_demand_response_buffer_index += tcp_tx_buffer_index;
+            tcp_tx_buffer_index = 0;
+            memset(&tcp_tx_buffer, 0xFF, sizeof(tcp_tx_buffer));
+
+        }
+        break;
+        case SIM_INFO_SUBCOMMAND:
+        {
+
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_STRING;
+            on_demand_response_buffer_index += 1;
+            read_gateway_info("awk -F':' '/Provider/ {print $2}' /home/GW_HES/SIM.txt | cut -d' ' -f2-",&read_gateway_data);
+            on_demand_response_buffer[on_demand_response_buffer_index] = read_gateway_data.length;
+            on_demand_response_buffer_index += 1;
+            memcpy(&on_demand_response_buffer[on_demand_response_buffer_index], &read_gateway_data.buffer[0], read_gateway_data.length);
+            on_demand_response_buffer_index += read_gateway_data.length;
+            memset(&read_gateway_data.buffer[0], 0xFF, sizeof(read_gateway_data.buffer));
+            read_gateway_data.length = 0;
+
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_STRING;
+            on_demand_response_buffer_index += 1;
+            read_gateway_info("awk -F':' '/SIM/ {print $2}' /home/GW_HES/SIM.txt | cut -d' ' -f2-",&read_gateway_data);
+            on_demand_response_buffer[on_demand_response_buffer_index] = read_gateway_data.length;
+            on_demand_response_buffer_index += 1;
+            memcpy(&on_demand_response_buffer[on_demand_response_buffer_index], &read_gateway_data.buffer[0], read_gateway_data.length);
+            on_demand_response_buffer_index += read_gateway_data.length;
+            memset(&read_gateway_data.buffer[0], 0xFF, sizeof(read_gateway_data.buffer));
+            read_gateway_data.length = 0;
+
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_STRING;
+            on_demand_response_buffer_index += 1;
+            read_gateway_info("awk -F':' '/ICCID/ {print $2}' /home/GW_HES/SIM.txt | cut -d' ' -f2-",&read_gateway_data);
+            on_demand_response_buffer[on_demand_response_buffer_index] = read_gateway_data.length;
+            on_demand_response_buffer_index += 1;
+            memcpy(&on_demand_response_buffer[on_demand_response_buffer_index], &read_gateway_data.buffer[0], read_gateway_data.length);
+            on_demand_response_buffer_index += read_gateway_data.length;
+            memset(&read_gateway_data.buffer[0], 0xFF, sizeof(read_gateway_data.buffer));
+            read_gateway_data.length = 0;
+
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_STRING;
+            on_demand_response_buffer_index += 1;
+            read_gateway_info("awk -F':' '/APN/ {print $2}' /home/GW_HES/SIM.txt | cut -d' ' -f2-",&read_gateway_data);
+            on_demand_response_buffer[on_demand_response_buffer_index] = read_gateway_data.length;
+            on_demand_response_buffer_index += 1;
+            memcpy(&on_demand_response_buffer[on_demand_response_buffer_index], &read_gateway_data.buffer[0], read_gateway_data.length);
+            on_demand_response_buffer_index += read_gateway_data.length;
+            memset(&read_gateway_data.buffer[0], 0xFF, sizeof(read_gateway_data.buffer));
+            read_gateway_data.length = 0;
+        }
+        break;
+        }
+    }
+    break;
+    case WIREPAS_COMMAND:
+    {
+        uint8_t command_length;
+        const char* sink;
+        switch (tcp_rx_packet->sub_command)
+        {
+        case STOP_SERVICE_SUBCOMMAND:
+        {
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = 0x00; //Success
+            on_demand_response_buffer_index += 1;
+            response_send_flag = 1;
+            write(*server_accept_socket, &on_demand_response_buffer[0], on_demand_response_buffer_index);
+            if (system("cd $(find /home -name single_transport -type d -print -quit) && docker compose down") == -1)
+            {
+                printf("ON DEMAND ERROR : Stop services\n");
+            }
+
+        }
+        break;
+        case START_SERVICE_SUBCOMMAND:
+        {
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = 0x00;
+            on_demand_response_buffer_index += 1;
+            response_send_flag = 1;
+            write(*server_accept_socket, &on_demand_response_buffer[0], on_demand_response_buffer_index);
+            if (system("cd $(find /home -name single_transport -type d -print -quit) && docker compose up -d") == -1)
+            {
+                printf("ON DEMAND ERROR : Start services\n");
+            }
+
+        }
+        break;
+        case RESTART_SERVICE_SUBCOMMAND:
+        {
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = 0x00;
+            on_demand_response_buffer_index += 1;
+            response_send_flag = 1;
+            write(*server_accept_socket, &on_demand_response_buffer[0], on_demand_response_buffer_index);
+            if (system("cd $(find /home -name single_transport -type d -print -quit) && docker compose restart") == -1)
+            {
+                printf("ON DEMAND ERROR : Restart services\n");
+            }
+
+        }
+        break;
+        case SINK_STATUS_SUBCOMMAND:
+        {
+            command_length = 0;
+            memset(&command[0], 0xff, sizeof(command));
+            chdir("/usr/local/bin");
+            command_length = snprintf(command, sizeof(command), "python3 sink_status.pyc");
+            command[command_length] = '\0';
+#if DEBUG_PRINT
+            printf("ON DEMAND DEBUG : %s\n", command);
+#endif
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+            on_demand_response_buffer_index += 1;
+
+            if (system(command) == -1)
+            {
+                printf("ON DEMAND ERROR : Get Sink Config failed\n");
+                on_demand_response_buffer[on_demand_response_buffer_index] = 0x01;
+                on_demand_response_buffer_index += 1;
+
+            }
+            else
+            {
+                sleep(10);
+                if (true == (read_json(on_demand_response_buffer, &on_demand_response_buffer_index)))
+                {
+                    printf("Returned length : %d\n", on_demand_response_buffer_index);
+                    printf("ON DEMAND SUCCESS : Get Sink Config\n");
+
+                }
+                else
+                {
+                    printf("ON DEMAND ERROR : Get Sink Config failed\n");
+                    on_demand_response_buffer[on_demand_response_buffer_index] = 0x01;
+                    on_demand_response_buffer_index += 1;
+                }
+            }
+        }
+        break;
+        case START_STACK_SUBCOMMAND:
+        {
+            command_length = 0;
+            memset(&command[0], 0xff, sizeof(command));
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+            on_demand_response_buffer_index += 1;
+            uint8_t option=0;
+            if (tcp_rx_packet->optional[0] == 0x00)
+            {
+                option=0;
+            }
+            else if (tcp_rx_packet->optional[0] == 0x01)
+            {
+                option=1;
+            }
+            else if (tcp_rx_packet->optional[0] == 0x02)
+            {
+                option=2;
+            }
+            chdir("/usr/local/bin");
+            command_length = snprintf(command, sizeof(command), "python3 get_set.pyc start %d ", option);
+            command[command_length] = '\0';
+#if DEBUG_PRINT
+            printf("ON DEMAND DEBUG : %s\n", command);
+#endif
+            if (system(command) == -1)
+            {
+                printf("ON DEMAND ERROR : Stack Start failed\n");
+                on_demand_response_buffer[on_demand_response_buffer_index] = 0x01;
+            }
+            else
+            {
+               sleep(10);
+                if (2 == verify_command_output())
+                {
+                    printf("ON DEMAND SUCCESS : Stack Started \n");
+                    on_demand_response_buffer[on_demand_response_buffer_index] = 0x00;
+                }
+                else
+                {
+                    printf("ON DEMAND ERROR : Stack Start failed\n");
+                    on_demand_response_buffer[on_demand_response_buffer_index] = 0x01;
+                }
+            }
+            on_demand_response_buffer_index += 1;
+
+        }
+        break;
+        case STOP_STACK_SUBCOMMAND:
+        {
+
+            command_length = 0;
+            memset(&command[0], 0xff, sizeof(command));
+
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+            on_demand_response_buffer_index += 1;
+            uint8_t option=0;
+            if (tcp_rx_packet->optional[0] == 0x00)
+            {
+                option=0;
+            }
+            else if (tcp_rx_packet->optional[0] == 0x01)
+            {
+                option=1;
+            }
+            else if (tcp_rx_packet->optional[0] == 0x02)
+            {
+                option=2;
+            }
+
+            chdir("/usr/local/bin");
+            command_length = snprintf(command, sizeof(command), "python3 get_set.pyc stop %d", option);
+            command[command_length] = '\0';
+#if DEBUG_PRINT
+            printf("ON DEMAND DEBUG : %s\n", command);
+#endif
+            if (system(command) == -1)
+            {
+                printf("ON DEMAND ERROR : Stack Stop failed\n");
+                on_demand_response_buffer[on_demand_response_buffer_index] = 0x01;
+            }
+            else
+            {
+                sleep(10);
+                if (2 == verify_command_output())
+                {
+                    printf("ON DEMAND SUCCESS : Stack Stopped \n");
+                    on_demand_response_buffer[on_demand_response_buffer_index] = 0x00;
+                }
+                else
+                {
+                    printf("ON DEMAND ERROR : Stack Stop failed\n");
+                    on_demand_response_buffer[on_demand_response_buffer_index] = 0x01;
+                }
+                ;
+            }
+            on_demand_response_buffer_index += 1;
+        }
+        break;
+        case PROD_TEST_SUBCOMMAND:
+        {
+            command_length = 0;
+            memset(&command[0], 0xff, sizeof(command));
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+            on_demand_response_buffer_index += 1;
+            uint8_t DUT = tcp_rx_packet->optional[0];
+            chdir("/usr/local/bin");
+            command_length = snprintf(command, sizeof(command), "python3 bSmartIOT_GW_Production_Test_v1.6.py --gateway %s --DUT %hhd", hostname, DUT);
+            command[command_length] = '\0';
+#if DEBUG_PRINT
+            printf("ON DEMAND DEBUG : %s\n", command);
+#endif
+            if (system(command) == -1)
+            {
+                printf("ON DEMAND ERROR : Production test failed\n");
+                on_demand_response_buffer[on_demand_response_buffer_index] = 0x01;
+            }
+            else
+            {
+                if (2 == verify_command_output())
+                {
+                    printf("ON DEMAND SUCCESS : Production test completed\n");
+                    on_demand_response_buffer[on_demand_response_buffer_index] = 0x00;
+                }
+                else
+                {
+                    printf("ON DEMAND ERROR : Production test failed\n");
+                    on_demand_response_buffer[on_demand_response_buffer_index] = 0x01;
+                }
+            }
+            on_demand_response_buffer_index += 1;
+        }
+        break;
+        case SINK_CONFIG_SUBCOMMAND:
+        {
+        }
+        break;
+		       case CHANGE_ADDRESS_SUBCOMMAND:
+{
+    command_length = 0;
+    memset(&command[0], 0xff, sizeof(command));
+
+    on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+    on_demand_response_buffer_index += 1;
+    uint8_t option=0;
+    if (tcp_rx_packet->optional[0] == 0x00)
+    {
+        option=0;
+    }
+    else if (tcp_rx_packet->optional[0] == 0x01)
+    {
+        option=1;
+    }
+    else if (tcp_rx_packet->optional[0] == 0x02)
+    {
+        option=2;
+    }
+
+    chdir("/usr/local/bin");
+    command_length = snprintf(command, sizeof(command), "python3 script.py change_address %d", option);
+    command[command_length] = '\0';
+#if DEBUG_PRINT
+    printf("ON DEMAND DEBUG : %s\n", command);
+#endif
+    if (system(command) == -1)
+    {
+        printf("ON DEMAND ERROR : Change Address failed\n");
+        on_demand_response_buffer[on_demand_response_buffer_index] = 0x01;
+    }
+    else
+    {
+        sleep(10);
+        if (2 == verify_command_output())
+        {
+            printf("ON DEMAND SUCCESS : Address Changed\n");
+            on_demand_response_buffer[on_demand_response_buffer_index] = 0x00;
+        }
+        else
+        {
+            printf("ON DEMAND ERROR : Change Address failed\n");
+            on_demand_response_buffer[on_demand_response_buffer_index] = 0x01;
+        }
+        ;
+    }
+    on_demand_response_buffer_index += 1;
+}
+break;
+
+        }
+    }
+    break;
+    case FOTA_COMMAND:
+    {
+        static uint16_t page_size, total_page_count, byte_count, temp_page_count = 1;
+        static uint32_t image_size, temp_image_size;
+        uint16_t fota_rx_buffer_length = *tcp_rx_buffer_index;
+        uint8_t fota_rx_buffer[256];
+        memcpy(&fota_rx_buffer[0], &tcp_rx_packet[0], fota_rx_buffer_length);
+
+#if DEBUG_PRINT
+        printf("FOTA Rx Buffer length : %d\n", fota_rx_buffer_length);
+#endif
+
+        if (fota_rx_buffer[fota_rx_buffer_length - 1] != calculate_checksum(&fota_rx_buffer[0], (fota_rx_buffer_length - 1)))
+        {
+#if DEBUG_PRINT
+            printf("FOTA ERROR : Checksum mismatched\n");
+#endif
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = 0x01;
+            on_demand_response_buffer_index += 1;
+
+            break;
+        }
+        switch (tcp_rx_packet->sub_command)
+        {
+
+        case ERASE_SUBCOMMAND:
+        {
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+            on_demand_response_buffer_index += 1;
+
+            chdir("/home");
+            if (open_file("gw_stats_update.out", "w"))
+            {
+                printf("FOTA ERROR : Failed to open a file\n");
+                on_demand_response_buffer[on_demand_response_buffer_index] = 0x01;
+            }
+            else
+            {
+                on_demand_response_buffer[on_demand_response_buffer_index] = 0x00;
+
+            }
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = calculate_checksum(&on_demand_response_buffer[0], on_demand_response_buffer_index);
+            on_demand_response_buffer_index += 1;
+#if DEBUG_PRINT
+            printf("FOTA SUCCESS : Image transfer initiated\n");
+#endif
+            page_size = 0;
+            total_page_count = 0;
+            image_size = 0;
+            temp_image_size = 0;
+            temp_page_count = 1;
+        }
+        break;
+        case SET_INFO_SUBCOMMAND:
+        {
+            page_size = (fota_rx_buffer[12] << 8) | fota_rx_buffer[13];
+            total_page_count = (fota_rx_buffer[14] << 8) | fota_rx_buffer[15];
+            image_size = ((fota_rx_buffer[16] << 24) |
+                (fota_rx_buffer[17] << 16) |
+                (fota_rx_buffer[18] << 8) |
+                (fota_rx_buffer[19]));
+
+            temp_image_size = image_size;
+
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = 0x00;
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = calculate_checksum(&on_demand_response_buffer[0], on_demand_response_buffer_index);
+            on_demand_response_buffer_index += 1;
+
+#if DEBUG_PRINT
+            printf("FOTA INFO : New firmware information is listed below\nImage size = %d\nPage size = %d\nPage Count = %d\n", image_size, page_size, total_page_count);
+#endif
+
+        }
+        break;
+        case IMAGE_TRANSFER_SUBCOMMAND:
+        {
+#if DEBUG_PRINT
+            printf("FOTA DEBUG : Received image transfer command : ");
+            for (uint16_t i = 0; i < 14; i++)
+            {
+                printf("%02X ", fota_rx_buffer[i]);
+            }
+            printf("\nFirmware content : ");
+            for (uint16_t i = 14; i < fota_rx_buffer_length; i++)
+            {
+                printf("%02X ", fota_rx_buffer[i]);
+            }
+
+#endif
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT16;
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = temp_page_count >> 8;
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = temp_page_count;
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+            on_demand_response_buffer_index += 1;
+
+
+
+            if (temp_page_count != ((fota_rx_buffer[12] << 8) | fota_rx_buffer[13]))
+            {
+#if DEBUG_PRINT
+                printf("FOTA ERROR : Page mismatched\n");
+#endif
+                //mismatch in page count
+                on_demand_response_buffer[on_demand_response_buffer_index] = 0x01;
+                page_size = 0;
+                total_page_count = 0;
+                image_size = 0;
+                temp_image_size = 0;
+                temp_page_count = 1;
+            }
+            else if (temp_page_count == ((fota_rx_buffer[12] << 8) | fota_rx_buffer[13]))
+            {
+
+                byte_count = fwrite(&fota_rx_buffer[14], 1, MIN(image_size, page_size), firmware_file_pointer);
+#if DEBUG_PRINT
+                printf("DEBUG : Firmware bytes written to file : %d\n", byte_count);
+                printf("FOTA DEBUG : File pointer position : %ld\n", ftell(firmware_file_pointer));
+                printf("\nFOTA DEBUG : Local page count = %d\n", temp_page_count);
+#endif
+
+                //successfully written to file
+                on_demand_response_buffer[on_demand_response_buffer_index] = 0x00;
+                image_size -= page_size;
+#if DEBUG_PRINT
+                printf("IMAGE TRANSFER DEBUG : Image size after writing to file : %d\n", image_size);
+#endif
+                temp_page_count++;
+            }
+
+            else
+            {
+#if DEBUG_PRINT
+                printf("FOTA ERROR : Failure in the storage of a BLOCK to file\n");
+#endif
+                //failure Failure in the storage of a BLOCK to file
+                on_demand_response_buffer[on_demand_response_buffer_index] = 0x02;
+                page_size = 0;
+                total_page_count = 0;
+                image_size = 0;
+                temp_image_size = 0;
+                temp_page_count = 1;
+
+            }
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = calculate_checksum(&on_demand_response_buffer[0], on_demand_response_buffer_index);
+            on_demand_response_buffer_index += 1;
+
+            //close file after image transfer
+            if (total_page_count == (temp_page_count - 1) )
+            {
+#if DEBUG_PRINT
+                printf("FOTA SUCCESS : All pages are received closing file....\n");
+#endif
+                byte_count = 0;
+                printf("FOTA DEBUG : File pointer position after writing completed : %ld\n", ftell(firmware_file_pointer));
+                fclose(firmware_file_pointer);
+            }
+        }
+        break;
+        case VERIFY_IMAGE_SUBCOMMAND:
+        {
+            open_file("gw_stats_update.out", "rb");
+            uint16_t wCrc = 0;
+            uint8_t temp_buffer[51200] = { 0xFF };
+#if DEBUG_PRINT
+            printf("VERIFY DEBUG : Temp image size : %d\n", temp_image_size);
+#endif
+            byte_count = fread(&temp_buffer[0], 1, temp_image_size, firmware_file_pointer);
+
+#if DEBUG_PRINT
+                printf("VERIFY DEBUG : Bytes read from file : %d\n", byte_count);
+                printf("FOTA DEBUG : File pointer position : %ld\n", ftell(firmware_file_pointer));
+#endif
+                wCrc = crc_calculator((char*)&temp_buffer[0], byte_count);
+
+#if DEBUG_PRINT
+                printf("Returned wCrc : %02X\n", wCrc);
+#endif
+
+#if 0
+            while (temp_image_size)
+            {
+
+                uint8_t temp_buffer[1024] = { 0xFF };
+                uint8_t bytes_to_read_from_file = MIN(temp_image_size, page_size);
+#if DEBUG_PRINT
+                printf("FOTA DEBUG : Minimum value to read : %d\n", bytes_to_read_from_file);
+#endif
+                byte_count = fread(&temp_buffer[0], 1, bytes_to_read_from_file, firmware_file_pointer);
+
+                temp_image_size -= byte_count;
+#if DEBUG_PRINT
+                printf("VERIFY DEBUG : Bytes read from file : %d\n", byte_count);
+                printf("FOTA DEBUG : File pointer position : %ld\n", ftell(firmware_file_pointer));
+                printf("VERIFY DEBUG : Temp image size : %d\n", temp_image_size);
+
+#endif
+                wCrc = crc_calculator((char*)&temp_buffer[0], byte_count, wCrc, temp_image_size);
+#if DEBUG_PRINT
+                printf("Returned wCrc : %02X\n", wCrc);
+#endif
+            }
+#endif
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+            on_demand_response_buffer_index += 1;
+
+            if (wCrc == ((fota_rx_buffer[12] << 8) | fota_rx_buffer[13]))
+            {
+#if DEBUG_PRINT
+                printf("FOTA SUCCESS : CRC verification\n");
+#endif
+                on_demand_response_buffer[on_demand_response_buffer_index] = 0x00;
+            }
+            else
+            {
+#if DEBUG_PRINT
+                printf("FOTA ERROR : CRC verification failed\n");
+#endif
+                on_demand_response_buffer[on_demand_response_buffer_index] = 0x01;
+                page_size = 0;
+                total_page_count = 0;
+                image_size = 0;
+                temp_image_size = 0;
+                temp_page_count = 1;
+
+            }
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = calculate_checksum(&on_demand_response_buffer[0], on_demand_response_buffer_index);
+            on_demand_response_buffer_index += 1;
+            fclose(firmware_file_pointer);
+        }
+        break;
+        case ACTIVATE_IMAGE_SUBCOMMAND:
+        {
+            on_demand_response_buffer[on_demand_response_buffer_index] = DLMS_DATA_TYPE_UINT8;
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = 0x00;
+            on_demand_response_buffer_index += 1;
+            on_demand_response_buffer[on_demand_response_buffer_index] = calculate_checksum(&on_demand_response_buffer[0], on_demand_response_buffer_index);
+            on_demand_response_buffer_index += 1;
+            response_send_flag = 1;
+            write(*server_accept_socket, &on_demand_response_buffer[0], on_demand_response_buffer_index);
+
+            execute_command("systemctl enable gw_mgt_fota.service");
+            execute_command("systemctl start gw_mgt_fota.service");
+
+            execute_command("systemctl stop gw_mgt.service");
+            execute_command("systemctl disable gw_mgt.service");
+
+            page_size = 0;
+            total_page_count = 0;
+            image_size = 0;
+            temp_image_size = 0;
+            temp_page_count = 1;
+        }
+        break;
+        }
+
+    }
+    break;
+    }
+#if DEBUG_PRINT
+    printf("ON_DEMAND DEBUG : On demand response to be send : ");
+    for (uint16_t i = 0; i < on_demand_response_buffer_index; i++) {
+        printf("%02X ", on_demand_response_buffer[i]);
+    }
+    printf("\n");
+#endif
+
+    if (response_send_flag != 1)
+    {
+#if DEBUG_PRINT
+        printf("ON DEMAND RESPONSE DEBUG : Sending reponse\n");
+#endif
+        write(*server_accept_socket, &on_demand_response_buffer[0], on_demand_response_buffer_index);
+    }
+    response_send_flag = 0;
+    on_demand_response_buffer_index = 0;
+    memset(&on_demand_response_buffer, 0xFF, sizeof(on_demand_response_buffer));
+}
+
+void validate_tcp_received_packet(uint8_t* tcp_rx_buffer, uint16_t* tcp_rx_buffer_index, int* server_accept_socket)
+{
+    on_demand_response_buffer_index = 0;
+    memset(&on_demand_response_buffer, 0xFF, sizeof(on_demand_response_buffer));
+
+#if DEBUG_PRINT
+    printf("ON DEMAND DEBUG : OnDemand requested received frame : ");
+    for (uint8_t i = 0; i < *tcp_rx_buffer_index; i++)
+        printf("%02X ", tcp_rx_buffer[i]);
+#endif
+
+    //Validation of packet as per the generic command format or not
+    if ((tcp_rx_buffer[0] == 0x0B) && ((tcp_rx_buffer[2] | (tcp_rx_buffer[1] << 8)) == (*tcp_rx_buffer_index - 1)))
+    {
+        process_receive_command((bsmart_iot_frame_struct_t*)tcp_rx_buffer, tcp_rx_buffer_index, server_accept_socket);
+    }
+}
+
+static void* server_connection_handler(void* vargp)
+{
+    char ip[INET6_ADDRSTRLEN];
+    uint8_t tcp_rx_buffer[MAX_RX_BUFF_SIZE];
+    uint16_t tcp_rx_buffer_index = 0;
+    int server_fd,reuse = 1;
+    struct sockaddr_in6 address;
+    int addrlen = sizeof(address);
+    memset(&tcp_rx_buffer[0], 0xff, sizeof(tcp_rx_buffer));
+    // Create a socket
+    if ((server_fd = socket(AF_INET6, SOCK_STREAM, 0)) == 0) {
+        perror("SERVER ERROR : Socket creation failed");
+        server_accept_socket = -1;
+
+    }
+
+    // Enable SO_REUSEADDR option
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(int)) == -1) {
+        perror("setsockopt");
+    }
+
+    // Initialize address struct
+    memset(&address, 0, addrlen);
+    address.sin6_family = AF_INET6;
+    address.sin6_addr = in6addr_any;
+    address.sin6_port = htons(SERVER_LISTEN_PORT);
+
+    // Bind the socket to the specified address and port
+    if (bind(server_fd, (struct sockaddr*)&address, addrlen) < 0) {
+        perror("SERVER ERROR : Bind failed");
+        server_accept_socket = -1;
+
+    }
+
+    // Listen for incoming connections
+    if (listen(server_fd, 3) < 0) {
+        perror("SERVER ERROR : Listen failed");
+        server_accept_socket = -1;
+    }
+
+    printf("SERVER : Listening on port : %d\n", SERVER_LISTEN_PORT);
+
+    // Accept incoming connections and handle them
+    while (1)
+    {
+
+       if (server_accept_socket == -1)
+       {
+            printf("In server accept socket = 0\n");
+            server_accept_socket = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen);
+            if (server_accept_socket == -1)
+            {
+                perror("SERVER ERROR : Accept failed");
+                server_accept_socket = -1;
+            }
+            inet_ntop(AF_INET6, &(address.sin6_addr), ip, INET6_ADDRSTRLEN);
+            printf("SERVER INFO : Connection established with client IP : %s and PORT : %d\n", ip, ntohs(address.sin6_port));
+#if DEBUG_PRINT
+            printf("SERVER DEBUG : Server accept value : %d\n", server_accept_socket);
+#endif
+
+        }
+        else
+        {
+
+            while(1)
+            {
+#if DEBUG_PRINT
+              printf("SERVER DEBUG : Already connected client\n");
+#endif
+             // Read incoming data from the client
+             tcp_rx_buffer_index = recv(server_accept_socket, tcp_rx_buffer, sizeof(tcp_rx_buffer), 0);
+             if (tcp_rx_buffer_index > 0)
+             {
+#if DEBUG_PRINT
+
+              printf("\n");
+              printf("DEBUG : Received buffer length : %d\n", tcp_rx_buffer_index);
+#endif
+              validate_tcp_received_packet(&tcp_rx_buffer[0], &tcp_rx_buffer_index, &server_accept_socket);
+            }
+            else if (tcp_rx_buffer_index <= 0)
+            {
+              printf("SERVER INFO : Client disconnected\n");
+              break;
+            }
+      }
+      printf("SERVER INFO: Exit from Session\n\n");
+      server_accept_socket = -1;
+      close(server_accept_socket);
+      }
+
+   }
+}
+
+void get_client_ip_address(uint8_t* CLIENT_ADDR)
+{
+    read_gateway_info("ip_addr=$(ifconfig ppp0 | awk '/inet6 .*global/ { print $2; exit }' | cut -d ':' -f 1-4) && echo $ip_addr::2", &read_gateway_data);
+    memcpy(&CLIENT_ADDR[0], &read_gateway_data.buffer[0], read_gateway_data.length);
+    memset(&read_gateway_data.buffer[0], 0xFF, sizeof(read_gateway_data.buffer));
+    read_gateway_data.length = 0;
+}
+
+void send_to_server(uint8_t* payload, uint16_t payload_len)
+{
+    int sockfd1, optval = 1;
+    struct sockaddr_in6 servaddr, localaddr;
+#if DEBUG_PRINT
+    printf("CLIENT DEBUG : TCP tx buffer : ");
+    for (uint16_t i = 0; i < payload_len; i++)
+    {
+        printf("%02X ", payload[i]);
+    }
+
+    //make packet frame as per bsmart iot protocol
+    printf("   TCP Tx buffer length : %d\n", payload_len);
+#endif
+
+    //create socket
+    sockfd1 = socket(AF_INET6, SOCK_STREAM, 0);
+    if (sockfd1 == -1) {
+        perror("CLIENT ERROR : Socket creation failed");
+
+    }
+    else
+        printf("CLIENT : Socket created\n");
+
+    bzero(&servaddr, sizeof(servaddr));
+    bzero(&localaddr, sizeof(servaddr));
+
+    get_client_ip_address(CLIENT_ADDR);
+
+
+#if DEBUG_PRINT
+    printf("\nCLIENT DEBUG : Client ip address : %s\n", CLIENT_ADDR);
+#endif
+
+    //bind to specific port
+    localaddr.sin6_family = AF_INET6;
+    inet_pton(AF_INET6, CLIENT_ADDR, &localaddr.sin6_addr);
+
+    localaddr.sin6_port = htons(CLIENT_PORT);  // Any local port will do
+    setsockopt(sockfd1, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+    if ((bind(sockfd1, (struct sockaddr*)&localaddr, sizeof(localaddr))) == 0)
+        printf("CLIENT : Bind success\n");
+    else
+        perror("CLIENT ERROR : Failed to bind");
+
+    // assign server IP, PORT
+    servaddr.sin6_family = AF_INET6;
+    servaddr.sin6_port = htons(SERVER_PORT);
+    // Convert IPv6 address from string to binary form
+    if (inet_pton(AF_INET6, SERVER_ADDR, &servaddr.sin6_addr) <= 0) {
+        perror("CLIENT ERROR : inet_pton failed");
+
+    }
+
+    // connect the client socket to server socket
+    if (connect(sockfd1, (struct sockaddr*)&servaddr, sizeof(servaddr)) != 0) {
+        perror("CLIENT ERROR : Connection with the server failed");
+        close(sockfd1);
+
+    }
+    else
+        printf("CLIENT : Connected to the server\n");
+
+
+    if (send(sockfd1, &payload[0], payload_len, 0) == payload_len)
+    {
+        //printf("CLIENT : TCP payload sent");
+        retry_count = 0;
+        tcp_send_flag = 1;
+    }
+    else
+    {
+        perror("CLIENT ERROR : TCP send failed");
+        tcp_send_flag = 0;
+    }
+
+    // close the socket
+    close(sockfd1);
+}
+
+void read_gateway_info(const char* command, read_gateway_info_struct_t* ouptut_data_struct)
+{
+    // Open the command as a process and read its output into the buffer
+    fp = popen(command, "r");
+    if (fp == NULL) {
+        printf("DEBUG ERROR : Failed to execute generic gateway read command\n");
+    }
+
+    ouptut_data_struct->length = ((fread(&ouptut_data_struct->buffer[0], sizeof(uint8_t), 100, fp)) - 1);
+    fclose(fp);
+}
+
+void send_boot_msg(void)
+{
+    tcp_tx_buffer_index = 0;
+
+    //Boot reason
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_UINT8;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = BOOT_UP_MSG;
+    tcp_tx_buffer_index += 1;
+
+    //gateway name
+    read_gateway_info("hostname", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_STRING;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = read_gateway_data.length;
+    tcp_tx_buffer_index += 1;
+    memcpy(&tcp_tx_buffer[tcp_tx_buffer_index], &read_gateway_data.buffer[0], read_gateway_data.length);
+    memcpy(&hostname[0], &read_gateway_data.buffer[0], read_gateway_data.length);
+    hostname[read_gateway_data.length] = '\0';
+#if DEBUG_PRINT
+    printf("DEBUG : Hostname : %s\n", hostname);
+#endif
+    tcp_tx_buffer_index += read_gateway_data.length;
+    read_gateway_data.length = 0;
+
+    //OS version
+    read_gateway_info("cat /etc/lsb-release | grep DISTRIB_DESCRIPTION | cut -d '=' -f 2", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_STRING;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = read_gateway_data.length - 2;
+    tcp_tx_buffer_index += 1;
+    memcpy(&tcp_tx_buffer[tcp_tx_buffer_index], &read_gateway_data.buffer[1], read_gateway_data.length - 2);
+    tcp_tx_buffer_index += read_gateway_data.length - 2;
+    read_gateway_data.length = 0;
+
+    //mac_id
+    memcpy(&read_gateway_data.buffer[0], "NA", 2);
+    read_gateway_data.length = 2;
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_STRING;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = read_gateway_data.length;
+    tcp_tx_buffer_index += 1;
+    memcpy(&tcp_tx_buffer[tcp_tx_buffer_index], &read_gateway_data.buffer[0], read_gateway_data.length);
+    tcp_tx_buffer_index += read_gateway_data.length;
+    read_gateway_data.length = 0;
+
+    //App firware version
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_STRING;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = 17;
+    tcp_tx_buffer_index += 1;
+    memcpy(&tcp_tx_buffer[tcp_tx_buffer_index], "bSmartIOT_GW_v3.0", 17);
+    tcp_tx_buffer_index += 17;
+
+    //Wirepas fimware version
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_STRING;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = 6;
+    tcp_tx_buffer_index += 1;
+    memcpy(&tcp_tx_buffer[tcp_tx_buffer_index], "v1.4.3", 6);
+    tcp_tx_buffer_index += 6;
+    read_gateway_data.length = 0;
+
+    //Sink count
+    read_gateway_info("cd $(find /home -name single_transport -type d -print -quit) && cat docker-compose.yml | grep 'container_name: bSmart_Sink' | wc -l", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_UINT8;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = atoi(read_gateway_data.buffer);
+    tcp_tx_buffer_index += 1;
+    read_gateway_data.length = 0;
+
+    //Sim slot number
+    read_gateway_info("cat /home/GW_HES/SIMslot.txt | awk '{print $2}'", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_UINT8;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = atoi(read_gateway_data.buffer);
+    tcp_tx_buffer_index += 1;
+
+    //cpu core
+    read_gateway_info("nproc", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_UINT8;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = atoi(read_gateway_data.buffer);
+    tcp_tx_buffer_index += 1;
+
+    //RAM total
+    read_gateway_info("free -m | awk 'NR==2 {print $2}'", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_UINT16;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = (atoi(read_gateway_data.buffer) >> 8);
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = atoi(read_gateway_data.buffer);
+    tcp_tx_buffer_index += 1;
+
+    //Storage total
+    read_gateway_info("df -h -m | grep /dev/root | cut -d ' ' -f 12", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_UINT16;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = (atoi(read_gateway_data.buffer) >> 8);
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = atoi(read_gateway_data.buffer);
+    tcp_tx_buffer_index += 1;
+
+    //date and time
+    read_gateway_info("date +%s", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_DATETIME;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = (atoi(read_gateway_data.buffer) >> 24);
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = (atoi(read_gateway_data.buffer) >> 16);
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = (atoi(read_gateway_data.buffer) >> 8);
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = atoi(read_gateway_data.buffer);
+    tcp_tx_buffer_index += 1;
+
+    //RX111 firmware version
+    read_gateway_info("cat /home/GW_HES/version.txt | awk -F'FIRMWARE_VER:' '{print $2}' | awk -F',' '{print $1}'", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_STRING;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = read_gateway_data.length;
+    tcp_tx_buffer_index += 1;
+    memcpy(&tcp_tx_buffer[tcp_tx_buffer_index], &read_gateway_data.buffer[0], read_gateway_data.length);
+    tcp_tx_buffer_index += read_gateway_data.length;
+    read_gateway_data.length = 0;
+
+    //send to server
+    send_to_server(&tcp_tx_buffer[0], tcp_tx_buffer_index);
+
+    tcp_tx_buffer_index = 0;
+    memset(&tcp_tx_buffer, 0xFF, sizeof(tcp_tx_buffer));
+}
+void wirepas_services_running_status(read_gateway_info_struct_t* ouptut_data_struct)
+{
+    FILE* docker_ps_output = popen("docker ps --format '{{.Names}}'", "r");
+    if (docker_ps_output == NULL) {
+        printf("DEBUG ERROR : Failed to run DOCKER PS command\n");
+
+    }
+
+    char containers[MAX_CONTAINERS][50];
+    char container[50];
+    int num_containers = 0;
+
+    // Read docker ps output and store container names in an array
+    while (fgets(container, sizeof(container), docker_ps_output) != NULL) {
+        // Remove newline character from the end of the string
+        container[strcspn(container, "\n")] = 0;
+        strncpy(containers[num_containers], container, sizeof(container));
+        num_containers++;
+    }
+    pclose(docker_ps_output);
+
+    FILE* compose_output = popen("cd $(find /home -name single_transport -type d -print -quit) && cat docker-compose.yml | grep 'container_name: ' | cut -d: -f2- | sed 's/ //g'", "r");
+    if (compose_output == NULL) {
+        printf("DEBUG ERROR : Failed to run TOTAL WP SERVICES command\n");
+
+    }
+
+    char compose_containers[MAX_CONTAINERS][50];
+    char compose_container[50];
+    int num_compose_containers = 0;
+
+    // Read docker-compose output and store container names in an array
+    while (fgets(compose_container, sizeof(compose_container), compose_output) != NULL) {
+        // Remove newline character from the end of the string
+        compose_container[strcspn(compose_container, "\n")] = 0;
+        strncpy(compose_containers[num_compose_containers], compose_container, sizeof(compose_container));
+        num_compose_containers++;
+    }
+    pclose(compose_output);
+
+    int found = 0;
+    // Compare the two arrays and print the containers that are in the compose file but not running
+    for (int i = 0; i < num_compose_containers; i++) {
+        found = 0;
+        for (int j = 0; j < num_containers; j++) {
+            if (strcmp(compose_containers[i], containers[j]) == 0) {
+                found = 1;
+                break;
+
+            }
+        }
+        if (!found) {
+            strncpy(&ouptut_data_struct->buffer[ouptut_data_struct->length], compose_containers[i], strlen(compose_containers[i]));
+            ouptut_data_struct->length += strlen(compose_containers[i]);
+            ouptut_data_struct->buffer[ouptut_data_struct->length] = ',';
+            ouptut_data_struct->length += 1;
+#if DEBUG_PRINT
+            printf("DEBUG INFO : WP service not running : %s\n", compose_containers[i]);
+#endif
+
+        }
+
+    }
+    if (ouptut_data_struct->length > 0) {
+        ouptut_data_struct->length = ouptut_data_struct->length - 1;
+    }
+}
+void send_diagnostic_msg(uint8_t ondemand_diagnostic_flag)
+{
+    tcp_tx_buffer_index = 0;
+
+    //Boot status
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_UINT8;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = DIAGNOSTIC_MSG;
+    tcp_tx_buffer_index += 1;
+
+    //gateway name
+    read_gateway_info("hostname", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_STRING;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = read_gateway_data.length;
+    tcp_tx_buffer_index += 1;
+    memcpy(&tcp_tx_buffer[tcp_tx_buffer_index], &read_gateway_data.buffer[0], read_gateway_data.length);
+    tcp_tx_buffer_index += read_gateway_data.length;
+    read_gateway_data.length = 0;
+
+    //Get cpu utilization
+    read_gateway_info("top -b -n1 | grep 'Cpu(s)' | awk '{print int($2+$4)}'", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_UINT8;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = atoi(read_gateway_data.buffer);
+    tcp_tx_buffer_index += 1;
+
+    //RAM used
+    read_gateway_info("free -m | awk 'NR==2{print $3+$6}'", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_UINT16;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = (atoi(read_gateway_data.buffer) >> 8);
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = atoi(read_gateway_data.buffer);
+    tcp_tx_buffer_index += 1;
+    read_gateway_data.length = 0;
+    memset(&read_gateway_data.buffer[0], 0xFF, sizeof(read_gateway_data.buffer));
+
+
+    //Storage used
+    read_gateway_info("df -h -m | grep /dev/root | cut -d ' ' -f 14", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_UINT16;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = (atoi(read_gateway_data.buffer) >> 8);
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = atoi(read_gateway_data.buffer);
+    tcp_tx_buffer_index += 1;
+    read_gateway_data.length = 0;
+    memset(&read_gateway_data.buffer[0], 0xFF, sizeof(read_gateway_data.buffer));
+
+
+    //Sim signal strength
+    read_gateway_info("cat /home/GW_HES/SIM.txt | awk -F': ' '/Signal Strength: / {print $2}' | awk '{print $1}'", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_UINT8;
+    tcp_tx_buffer_index += 1;
+    if(atoi(read_gateway_data.buffer) != 0)
+    {
+         tcp_tx_buffer[tcp_tx_buffer_index] = atoi(read_gateway_data.buffer);
+    }
+    else
+    {
+         tcp_tx_buffer[tcp_tx_buffer_index] = 23;
+    }
+    tcp_tx_buffer_index += 1;
+    read_gateway_data.length = 0;
+    memset(&read_gateway_data.buffer[0], 0xFF, sizeof(read_gateway_data.buffer));
+
+    //Cover open status
+    read_gateway_info("cat /home/GW_HES/battery.txt | awk -F'COVER_' '{print $2}' | awk -F',' '{print $1}'", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_UINT8;
+    tcp_tx_buffer_index += 1;
+
+    //close = 0, open = 1
+    if (!(memcmp(&read_gateway_data.buffer[0], "CLOSE", 5)))
+    {
+        tcp_tx_buffer[tcp_tx_buffer_index] = COVER_CLOSE;
+    }
+    else
+    {
+        tcp_tx_buffer[tcp_tx_buffer_index] = COVER_OPEN;
+    }
+    tcp_tx_buffer_index += 1;
+    read_gateway_data.length = 0;
+    memset(&read_gateway_data.buffer[0], 0xFF, sizeof(read_gateway_data.buffer));
+
+
+    //Battery level
+    read_gateway_info("cat /home/GW_HES/battery.txt | awk -F'BV_P:' '{print $2}' | awk -F'%' '{print $1}'", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_UINT8;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = atoi(read_gateway_data.buffer); //in percentage
+    tcp_tx_buffer_index += 1;
+    read_gateway_data.length = 0;
+    memset(&read_gateway_data.buffer[0], 0xFF, sizeof(read_gateway_data.buffer));
+
+    //Temperature
+    read_gateway_info("cat /sys/class/thermal/thermal_zone0/temp", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_UINT8;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = atoi(read_gateway_data.buffer) / 1000;  //in degree celsius
+    tcp_tx_buffer_index += 1;
+    read_gateway_data.length = 0;
+    memset(&read_gateway_data.buffer[0], 0xFF, sizeof(read_gateway_data.buffer));
+
+    //wirepas not running services
+    wirepas_services_running_status(&read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_STRING;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = read_gateway_data.length;
+    tcp_tx_buffer_index += 1;
+    memcpy(&tcp_tx_buffer[tcp_tx_buffer_index], &read_gateway_data.buffer[0], read_gateway_data.length);
+    tcp_tx_buffer_index += read_gateway_data.length;
+    read_gateway_data.length = 0;
+
+    //date and time
+    read_gateway_info("date +%s", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_DATETIME;
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = (atoi(read_gateway_data.buffer) >> 24);
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = (atoi(read_gateway_data.buffer) >> 16);
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = (atoi(read_gateway_data.buffer) >> 8);
+    tcp_tx_buffer_index += 1;
+    tcp_tx_buffer[tcp_tx_buffer_index] = atoi(read_gateway_data.buffer);
+    tcp_tx_buffer_index += 1;
+
+    //mains or battery power
+    read_gateway_info("cat /home/GW_HES/battery.txt | awk -F'MAINS_' '{print $2}' | awk -F',' '{print $1}'", &read_gateway_data);
+    tcp_tx_buffer[tcp_tx_buffer_index] = DLMS_DATA_TYPE_UINT8;
+    tcp_tx_buffer_index += 1;
+
+    //OFF = battery, ON = mains
+    if (!(memcmp(&read_gateway_data.buffer[0], "OFF", 3)))
+    {
+        tcp_tx_buffer[tcp_tx_buffer_index] = BATTERY;
+    }
+    else
+    {
+        tcp_tx_buffer[tcp_tx_buffer_index] = MAINS;
+    }
+    tcp_tx_buffer_index += 1;
+    read_gateway_data.length = 0;
+    memset(&read_gateway_data.buffer[0], 0xFF, sizeof(read_gateway_data.buffer));
+
+    //send to server as push
+    if (ondemand_diagnostic_flag == 0)
+    {
+        send_to_server(&tcp_tx_buffer[0], tcp_tx_buffer_index);
+        tcp_tx_buffer_index = 0;
+        memset(&tcp_tx_buffer, 0xFF, sizeof(tcp_tx_buffer));
+    }
+
+}
+int main(int argc, char* argv[])
+{
+    SERVER_ADDR = argv[1];
+    SERVER_PORT = atoi(argv[2]);
+    tcp_tx_buffer_index = 0;
+    memset(&tcp_tx_buffer[0], 0xFF, sizeof(tcp_tx_buffer));
+    ondemand_diagnostic_flag = 0;
+
+    //create thread for server
+    pthread_create(&TCP_ServerReadThread, NULL, server_connection_handler, NULL);
+
+    while (!tcp_send_flag)
+    {
+        //Bootup message
+        send_boot_msg();
+
+        if (retry_count++ == MAX_RETRY_COUNT)
+        {
+            printf("\nBOOT UP PUSH ERROR : EXITING APPLICATION : maximum retries over\n");
+            return 0;
+        }
+        sleep(10);
+        //        printf("\nBOOT UP PUSH ERROR: Retry Count : %d/MAX_RETRY_COUNT",retry_count);
+    }
+    retry_count = 0;
+    tcp_send_flag = 0;
+
+#if DEBUG_PRINT
+    printf("\nDEBUG : Retry count value : %d\n", retry_count);
+#endif
+
+
+    //create threads for alerts
+#if COVER_OPEN_ALERT
+    pthread_create(&TCP_ClientPushThread[COVER_OPEN_ALERT], NULL, cover_open_alert_handler, NULL);
+#endif
+#if LOW_BATTERY_ALERT
+    pthread_create(&TCP_ClientPushThread[LOW_BATTERY_ALERT], NULL, low_battery_alert_handler, NULL);
+#endif
+#if POOR_SIGNAL_STRENGTH_ALERT
+    pthread_create(&TCP_ClientPushThread[POOR_SIGNAL_STRENGTH_ALERT], NULL, poor_signal_alert_handler, NULL);
+#endif
+
+    sleep(diagnostic_interval_time);
+
+    while (1)
+    {
+        while (!tcp_send_flag)
+        {
+            send_diagnostic_msg(ondemand_diagnostic_flag);
+
+            if (retry_count++ == MAX_RETRY_COUNT)
+            {
+                printf("\nDIAGNOSTIC PUSH ERROR : EXITING APPLICATION : maximum retries over\n");
+                return 0;
+            }
+            if (!tcp_send_flag) {
+                sleep(10);
+            }
+            //printf("\nDIAGNOSTIC PUSH ERROR: Retry Count : %d/MAX_RETRY_COUNT",retry_count);
+
+        }
+        retry_count = 0;
+        tcp_send_flag = 0;
+#if DEBUG_PRINT
+        printf("DEBUG : Retry count value : %d\n", retry_count);
+#endif
+
+
+        sleep(diagnostic_interval_time);
+
+    }
+    return 0;
+}
